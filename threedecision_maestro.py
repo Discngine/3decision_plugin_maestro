@@ -41,8 +41,12 @@ def run_plugin():
         try:
             from schrodinger.Qt.QtWidgets import QMessageBox
             QMessageBox.critical(None, "3decision Plugin Error", msg)
-        except:
+        except ImportError:
+            # QMessageBox not available (running outside Maestro)
             pass
+        except Exception as ui_error:
+            # Log unexpected errors without crashing
+            print(f"WARNING: Could not display error dialog: {ui_error}")
         return None
 
 

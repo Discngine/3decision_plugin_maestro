@@ -8,253 +8,322 @@ Version: 1.0
 
 import os
 import sys
-import json
+import re
+import subprocess
 import tempfile
-from typing import Optional, Dict, List, Any
+from typing import Dict, List, Any
 
 # Import Schrodinger modules
 try:
     from schrodinger.ui.qt.appframework2 import af2
-    from schrodinger.ui.qt import swidgets
-    from schrodinger.Qt import QtWidgets, QtCore, QtGui
+    from schrodinger.Qt import QtGui
     from schrodinger.Qt.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
         QTableWidget, QTableWidgetItem, QLabel, QMessageBox, QHeaderView,
         QProgressBar, QCheckBox, QAbstractItemView, QTabWidget, QWidget,
-        QFormLayout, QComboBox, QFrame, QDialogButtonBox
+        QFormLayout, QComboBox, QDialogButtonBox
     )
     from schrodinger.Qt.QtCore import Qt, QThread, pyqtSignal
     from schrodinger.Qt.QtGui import QPixmap, QIcon
     from schrodinger import maestro, structure
     MAESTRO_AVAILABLE = True
-    SWIDGETS_AVAILABLE = True
 except ImportError:
     # Fallback for testing outside Maestro
-    from PyQt5 import QtWidgets, QtCore, QtGui
+    from PyQt5 import QtGui
     from PyQt5.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
         QTableWidget, QTableWidgetItem, QLabel, QMessageBox, QHeaderView,
         QProgressBar, QCheckBox, QAbstractItemView, QTabWidget, QWidget,
-        QFormLayout, QComboBox, QFrame, QDialogButtonBox
+        QFormLayout, QComboBox, QDialogButtonBox
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal
     from PyQt5.QtGui import QPixmap, QIcon
     MAESTRO_AVAILABLE = False
-    SWIDGETS_AVAILABLE = False
     af2 = None
-    swidgets = None
 
 # Import api_client - try relative import first, then absolute
+# Both forms needed: relative works when installed as package, absolute when run directly
 try:
-    from .api_client import ThreeDecisionAPIClient, is_logging_enabled, get_private_structure_naming_attribute
+    from .api_client import (
+        ThreeDecisionAPIClient, is_logging_enabled, get_private_structure_naming_attribute,
+        is_ssl_verify_enabled, set_ssl_verify_enabled
+    )
 except ImportError:
-    from api_client import ThreeDecisionAPIClient, is_logging_enabled, get_private_structure_naming_attribute
+    from api_client import (
+        ThreeDecisionAPIClient, is_logging_enabled, get_private_structure_naming_attribute,
+        is_ssl_verify_enabled, set_ssl_verify_enabled
+    )
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize a filename to prevent path traversal attacks.
+    Removes path separators and parent directory references.
+    """
+    # Get just the basename, removing any directory components
+    filename = os.path.basename(filename)
+    # Remove any remaining path traversal patterns
+    filename = filename.replace('..', '').replace('/', '').replace('\\', '')
+    # Remove null bytes
+    filename = filename.replace('\x00', '')
+    # If filename is empty after sanitization, use a default
+    if not filename:
+        filename = 'unnamed_file'
+    return filename
+
+
+def sanitize_surface_name(name: str) -> str:
+    """
+    Sanitize a surface name for use in Maestro commands.
+    Only allows alphanumeric characters, underscores, and hyphens.
+    """
+    return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
+
+
+# Color constants for dark theme
+COLOR_DARK_BG = "#444444"
+COLOR_DARK_BG_ALT = "#3a3a3a"
+COLOR_DARK_BORDER = "#555555"
+COLOR_TEXT = "#ECECEC"
+COLOR_TEXT_DIM = "#ABABAB"
+COLOR_TEXT_DISABLED = "#666666"
+COLOR_TEXT_PLACEHOLDER = "#888888"
+COLOR_ACCENT = "#60B0DC"
+COLOR_BUTTON = "#505050"
+COLOR_BUTTON_HOVER = "#585858"
+COLOR_BUTTON_PRESSED = "#404040"
+COLOR_BUTTON_BORDER = "#606060"
+COLOR_HEADER = "#4a4a4a"
+COLOR_SUCCESS = "#7FBA7A"
+COLOR_ERROR = "#FF6B6B"
+COLOR_SCROLLBAR = "#606060"
+COLOR_SCROLLBAR_HOVER = "#707070"
+
+
+def create_dark_palette():
+    """
+    Create a dark QPalette for widgets.
+    This ensures consistent dark theming across all widgets.
+    """
+    dark_palette = QtGui.QPalette()
+    dark_color = QtGui.QColor(68, 68, 68)  # COLOR_DARK_BG
+    dark_palette.setColor(QtGui.QPalette.Window, dark_color)
+    dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(58, 58, 58))  # COLOR_DARK_BG_ALT
+    dark_palette.setColor(QtGui.QPalette.AlternateBase, dark_color)
+    dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(80, 80, 80))  # COLOR_BUTTON
+    dark_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(236, 236, 236))  # COLOR_TEXT
+    dark_palette.setColor(QtGui.QPalette.Text, QtGui.QColor(236, 236, 236))
+    dark_palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(236, 236, 236))
+    dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(96, 176, 220))  # COLOR_ACCENT
+    dark_palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
+    dark_palette.setColor(QtGui.QPalette.PlaceholderText, QtGui.QColor(136, 136, 136))  # COLOR_TEXT_PLACEHOLDER
+    return dark_palette
 
 
 # Dark theme stylesheet matching Maestro's dark UI
-DARK_STYLESHEET = """
-    * {
-        background-color: #444444;
-        color: #ECECEC;
-    }
-    QWidget, QFrame, QDialog {
-        background-color: #444444;
-        color: #ECECEC;
-    }
-    QLabel {
+DARK_STYLESHEET = f"""
+    * {{
+        background-color: {COLOR_DARK_BG};
+        color: {COLOR_TEXT};
+    }}
+    QWidget, QFrame, QDialog {{
+        background-color: {COLOR_DARK_BG};
+        color: {COLOR_TEXT};
+    }}
+    QLabel {{
         background-color: transparent;
-        color: #ECECEC;
-    }
-    QStatusBar {
-        background-color: #3a3a3a;
-        color: #ECECEC;
-        border-top: 1px solid #555555;
-    }
-    QLineEdit {
-        background-color: #3a3a3a;
-        color: #ECECEC;
-        border: 1px solid #555555;
+        color: {COLOR_TEXT};
+    }}
+    QStatusBar {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT};
+        border-top: 1px solid {COLOR_DARK_BORDER};
+    }}
+    QLineEdit {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT};
+        border: 1px solid {COLOR_DARK_BORDER};
         border-radius: 3px;
         padding: 4px 6px;
-        selection-background-color: #60B0DC;
-    }
-    QLineEdit:focus {
-        border: 1px solid #60B0DC;
-    }
-    QLineEdit:disabled {
+        selection-background-color: {COLOR_ACCENT};
+    }}
+    QLineEdit:focus {{
+        border: 1px solid {COLOR_ACCENT};
+    }}
+    QLineEdit:disabled {{
         background-color: #383838;
-        color: #888888;
-    }
-    QLineEdit::placeholder {
-        color: #888888;
-    }
-    QComboBox {
-        background-color: #3a3a3a;
-        color: #ECECEC;
-        border: 1px solid #555555;
+        color: {COLOR_TEXT_PLACEHOLDER};
+    }}
+    QLineEdit::placeholder {{
+        color: {COLOR_TEXT_PLACEHOLDER};
+    }}
+    QComboBox {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT};
+        border: 1px solid {COLOR_DARK_BORDER};
         border-radius: 3px;
         padding: 4px 6px;
-    }
-    QComboBox:hover, QComboBox:focus {
-        border: 1px solid #60B0DC;
-    }
-    QComboBox::drop-down {
+    }}
+    QComboBox:hover, QComboBox:focus {{
+        border: 1px solid {COLOR_ACCENT};
+    }}
+    QComboBox::drop-down {{
         border: none;
         width: 20px;
-    }
-    QComboBox::down-arrow {
+    }}
+    QComboBox::down-arrow {{
         image: none;
         border-left: 4px solid transparent;
         border-right: 4px solid transparent;
-        border-top: 6px solid #ECECEC;
+        border-top: 6px solid {COLOR_TEXT};
         margin-right: 6px;
-    }
-    QComboBox QAbstractItemView {
-        background-color: #3a3a3a;
-        color: #ECECEC;
-        selection-background-color: #60B0DC;
-        border: 1px solid #555555;
-    }
-    QPushButton {
-        background-color: #505050;
-        color: #ECECEC;
-        border: 1px solid #606060;
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT};
+        selection-background-color: {COLOR_ACCENT};
+        border: 1px solid {COLOR_DARK_BORDER};
+    }}
+    QPushButton {{
+        background-color: {COLOR_BUTTON};
+        color: {COLOR_TEXT};
+        border: 1px solid {COLOR_BUTTON_BORDER};
         border-radius: 3px;
         padding: 5px 12px;
         min-height: 20px;
-    }
-    QPushButton:hover {
-        background-color: #585858;
-        border: 1px solid #60B0DC;
-    }
-    QPushButton:pressed {
-        background-color: #404040;
-    }
-    QPushButton:disabled {
-        background-color: #3a3a3a;
-        color: #666666;
-        border: 1px solid #4a4a4a;
-    }
-    QCheckBox {
+    }}
+    QPushButton:hover {{
+        background-color: {COLOR_BUTTON_HOVER};
+        border: 1px solid {COLOR_ACCENT};
+    }}
+    QPushButton:pressed {{
+        background-color: {COLOR_BUTTON_PRESSED};
+    }}
+    QPushButton:disabled {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT_DISABLED};
+        border: 1px solid {COLOR_HEADER};
+    }}
+    QCheckBox {{
         background-color: transparent;
-        color: #ECECEC;
+        color: {COLOR_TEXT};
         spacing: 6px;
-    }
-    QCheckBox::indicator {
+    }}
+    QCheckBox::indicator {{
         width: 16px;
         height: 16px;
-        border: 1px solid #555555;
+        border: 1px solid {COLOR_DARK_BORDER};
         border-radius: 2px;
-        background-color: #3a3a3a;
-    }
-    QCheckBox::indicator:checked {
-        background-color: #60B0DC;
-        border-color: #60B0DC;
-    }
-    QCheckBox::indicator:hover {
-        border-color: #60B0DC;
-    }
-    QTabWidget::pane {
-        border: 1px solid #555555;
-        background-color: #444444;
+        background-color: {COLOR_DARK_BG_ALT};
+    }}
+    QCheckBox::indicator:checked {{
+        background-color: {COLOR_ACCENT};
+        border-color: {COLOR_ACCENT};
+    }}
+    QCheckBox::indicator:hover {{
+        border-color: {COLOR_ACCENT};
+    }}
+    QTabWidget::pane {{
+        border: 1px solid {COLOR_DARK_BORDER};
+        background-color: {COLOR_DARK_BG};
         border-radius: 3px;
-    }
-    QTabBar::tab {
-        background-color: #3a3a3a;
-        color: #ABABAB;
-        border: 1px solid #555555;
+    }}
+    QTabBar::tab {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT_DIM};
+        border: 1px solid {COLOR_DARK_BORDER};
         border-bottom: none;
         padding: 6px 16px;
         margin-right: 2px;
         border-top-left-radius: 3px;
         border-top-right-radius: 3px;
-    }
-    QTabBar::tab:selected {
-        background-color: #444444;
-        color: #ECECEC;
-        border-bottom: 1px solid #444444;
-    }
-    QTabBar::tab:hover:!selected {
-        background-color: #404040;
-        color: #ECECEC;
-    }
-    QTableWidget {
-        background-color: #3a3a3a;
-        color: #ECECEC;
-        gridline-color: #555555;
-        border: 1px solid #555555;
-        selection-background-color: #60B0DC;
+    }}
+    QTabBar::tab:selected {{
+        background-color: {COLOR_DARK_BG};
+        color: {COLOR_TEXT};
+        border-bottom: 1px solid {COLOR_DARK_BG};
+    }}
+    QTabBar::tab:hover:!selected {{
+        background-color: {COLOR_BUTTON_PRESSED};
+        color: {COLOR_TEXT};
+    }}
+    QTableWidget {{
+        background-color: {COLOR_DARK_BG_ALT};
+        color: {COLOR_TEXT};
+        gridline-color: {COLOR_DARK_BORDER};
+        border: 1px solid {COLOR_DARK_BORDER};
+        selection-background-color: {COLOR_ACCENT};
         selection-color: #FFFFFF;
-    }
-    QTableWidget::item {
+    }}
+    QTableWidget::item {{
         padding: 4px;
-    }
-    QTableWidget::item:selected {
-        background-color: #60B0DC;
+    }}
+    QTableWidget::item:selected {{
+        background-color: {COLOR_ACCENT};
         color: #FFFFFF;
-    }
-    QHeaderView::section {
-        background-color: #4a4a4a;
-        color: #ECECEC;
+    }}
+    QHeaderView::section {{
+        background-color: {COLOR_HEADER};
+        color: {COLOR_TEXT};
         padding: 5px;
         border: none;
-        border-right: 1px solid #555555;
-        border-bottom: 1px solid #555555;
-    }
-    QHeaderView::section:hover {
-        background-color: #555555;
-    }
-    QProgressBar {
-        background-color: #3a3a3a;
-        border: 1px solid #555555;
+        border-right: 1px solid {COLOR_DARK_BORDER};
+        border-bottom: 1px solid {COLOR_DARK_BORDER};
+    }}
+    QHeaderView::section:hover {{
+        background-color: {COLOR_DARK_BORDER};
+    }}
+    QProgressBar {{
+        background-color: {COLOR_DARK_BG_ALT};
+        border: 1px solid {COLOR_DARK_BORDER};
         border-radius: 3px;
         text-align: center;
-        color: #ECECEC;
-    }
-    QProgressBar::chunk {
-        background-color: #60B0DC;
+        color: {COLOR_TEXT};
+    }}
+    QProgressBar::chunk {{
+        background-color: {COLOR_ACCENT};
         border-radius: 2px;
-    }
-    QScrollBar:vertical {
-        background-color: #3a3a3a;
+    }}
+    QScrollBar:vertical {{
+        background-color: {COLOR_DARK_BG_ALT};
         width: 12px;
         border: none;
-    }
-    QScrollBar::handle:vertical {
-        background-color: #606060;
+    }}
+    QScrollBar::handle:vertical {{
+        background-color: {COLOR_SCROLLBAR};
         min-height: 20px;
         border-radius: 3px;
         margin: 2px;
-    }
-    QScrollBar::handle:vertical:hover {
-        background-color: #707070;
-    }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background-color: {COLOR_SCROLLBAR_HOVER};
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
         height: 0px;
-    }
-    QScrollBar:horizontal {
-        background-color: #3a3a3a;
+    }}
+    QScrollBar:horizontal {{
+        background-color: {COLOR_DARK_BG_ALT};
         height: 12px;
         border: none;
-    }
-    QScrollBar::handle:horizontal {
-        background-color: #606060;
+    }}
+    QScrollBar::handle:horizontal {{
+        background-color: {COLOR_SCROLLBAR};
         min-width: 20px;
         border-radius: 3px;
         margin: 2px;
-    }
-    QScrollBar::handle:horizontal:hover {
-        background-color: #707070;
-    }
-    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background-color: {COLOR_SCROLLBAR_HOVER};
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
         width: 0px;
-    }
-    QDialogButtonBox QPushButton {
+    }}
+    QDialogButtonBox QPushButton {{
         min-width: 70px;
-    }
-    QFrame[frameShape="4"], QFrame[frameShape="5"] {
-        background-color: #555555;
-    }
+    }}
+    QFrame[frameShape="4"], QFrame[frameShape="5"] {{
+        background-color: {COLOR_DARK_BORDER};
+    }}
 """
 
 
@@ -481,18 +550,19 @@ class LoadStructureThread(QThread):
                 log_debug("Loading structures with transformation matrices using batch export")
                 self.status_update.emit("Loading structures with transformations...")
 
+                # Define identity matrix once outside the loop for efficiency
+                identity_matrix = [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0
+                ]
+
                 structures_with_transforms = []
                 for structure_info in self.structure_data:
                     structure_id = int(structure_info['structure_id'])
                     external_code = structure_info['external_code']
                     matrix = structure_info.get('matrix')
-
-                    identity_matrix = [
-                        1.0, 0.0, 0.0, 0.0,
-                        0.0, 1.0, 0.0, 0.0,
-                        0.0, 0.0, 1.0, 0.0,
-                        0.0, 0.0, 0.0, 1.0
-                    ]
 
                     if matrix:
                         if isinstance(matrix, list) and len(matrix) == 4:
@@ -656,6 +726,14 @@ class SettingsDialog(QDialog):
         self.api_key_input.setMinimumWidth(300)
         form_layout.addRow("API Key:", self.api_key_input)
 
+        # SSL verification checkbox
+        self.ssl_verify_checkbox = QCheckBox("Verify SSL certificates")
+        self.ssl_verify_checkbox.setToolTip(
+            "Enable SSL certificate verification for API requests.\n"
+            "Disable only for testing with self-signed certificates."
+        )
+        form_layout.addRow("", self.ssl_verify_checkbox)
+
         # Log events checkbox
         self.log_events_checkbox = QCheckBox("Log events")
         self.log_events_checkbox.setToolTip("Enable logging of plugin events to console")
@@ -705,6 +783,9 @@ class SettingsDialog(QDialog):
         if self.api_client.api_key:
             self.api_key_input.setText(self.api_client.api_key)
 
+        # Load SSL verification setting
+        self.ssl_verify_checkbox.setChecked(is_ssl_verify_enabled())
+
         try:
             from .api_client import is_logging_enabled, get_private_structure_naming_attribute
         except ImportError:
@@ -731,7 +812,7 @@ class SettingsDialog(QDialog):
 
         self.test_button.setEnabled(False)
         self.status_label.setText("Testing connection...")
-        self.status_label.setStyleSheet("color: #60B0DC;")
+        self.status_label.setStyleSheet(f"color: {COLOR_ACCENT};")
 
         # Configure and test
         old_url = self.api_client.base_url
@@ -742,10 +823,10 @@ class SettingsDialog(QDialog):
 
         if self.api_client.test_connection():
             self.status_label.setText("Connection successful!")
-            self.status_label.setStyleSheet("color: #7FBA7A; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {COLOR_SUCCESS}; font-weight: bold;")
         else:
             self.status_label.setText("Connection failed. Please check your URL and API key.")
-            self.status_label.setStyleSheet("color: #FF6B6B; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {COLOR_ERROR}; font-weight: bold;")
             # Restore old settings
             self.api_client.base_url = old_url
             self.api_client.api_key = old_key
@@ -769,6 +850,13 @@ class SettingsDialog(QDialog):
         # Configure and save API settings
         self.api_client.configure(url, api_key)
         self.api_client.save_config()
+
+        # Save SSL verification setting
+        ssl_enabled = self.ssl_verify_checkbox.isChecked()
+        set_ssl_verify_enabled(ssl_enabled)
+        self.api_client.save_ssl_setting(ssl_enabled)
+        # Apply to current session
+        self.api_client.session.verify = ssl_enabled
 
         # Save logging setting
         log_enabled = self.log_events_checkbox.isChecked()
@@ -833,83 +921,71 @@ if MAESTRO_AVAILABLE and af2:
             self.setStyleSheet(DARK_STYLESHEET)
 
             # Force dark background using palette
-            dark_palette = QtGui.QPalette()
-            dark_color = QtGui.QColor(68, 68, 68)  # #444444
-            dark_palette.setColor(QtGui.QPalette.Window, dark_color)
-            dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(58, 58, 58))
-            dark_palette.setColor(QtGui.QPalette.AlternateBase, dark_color)
-            dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(80, 80, 80))
-            dark_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.Text, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(96, 176, 220))
-            dark_palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
-            dark_palette.setColor(QtGui.QPalette.PlaceholderText, QtGui.QColor(136, 136, 136))  # #888888
-            self.setPalette(dark_palette)
+            self.setPalette(create_dark_palette())
             self.setAutoFillBackground(True)
 
             # Also style the af2 status bar if it exists
             if hasattr(self, 'status_bar') and self.status_bar:
-                self.status_bar.setStyleSheet("""
-                    QStatusBar {
-                        background-color: #3a3a3a;
-                        color: #ECECEC;
-                        border-top: 1px solid #555555;
-                    }
-                    QLabel {
-                        color: #ECECEC;
+                self.status_bar.setStyleSheet(f"""
+                    QStatusBar {{
+                        background-color: {COLOR_DARK_BG_ALT};
+                        color: {COLOR_TEXT};
+                        border-top: 1px solid {COLOR_DARK_BORDER};
+                    }}
+                    QLabel {{
+                        color: {COLOR_TEXT};
                         background-color: transparent;
-                    }
-                    QPushButton, QToolButton {
-                        background-color: #505050;
-                        color: #ECECEC;
-                        border: 1px solid #606060;
+                    }}
+                    QPushButton, QToolButton {{
+                        background-color: {COLOR_BUTTON};
+                        color: {COLOR_TEXT};
+                        border: 1px solid {COLOR_BUTTON_BORDER};
                         border-radius: 3px;
                         padding: 3px 8px;
-                    }
-                    QPushButton:hover, QToolButton:hover {
-                        background-color: #585858;
-                        border: 1px solid #60B0DC;
-                    }
-                    QProgressBar {
-                        background-color: #3a3a3a;
-                        border: 1px solid #555555;
+                    }}
+                    QPushButton:hover, QToolButton:hover {{
+                        background-color: {COLOR_BUTTON_HOVER};
+                        border: 1px solid {COLOR_ACCENT};
+                    }}
+                    QProgressBar {{
+                        background-color: {COLOR_DARK_BG_ALT};
+                        border: 1px solid {COLOR_DARK_BORDER};
                         border-radius: 3px;
                         text-align: center;
-                        color: #ECECEC;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #60B0DC;
-                    }
+                        color: {COLOR_TEXT};
+                    }}
+                    QProgressBar::chunk {{
+                        background-color: {COLOR_ACCENT};
+                    }}
                 """)
 
             # Also style the bottom bar if it exists
             if hasattr(self, 'bottom_bar') and self.bottom_bar:
-                self.bottom_bar.setStyleSheet("""
-                    QWidget {
-                        background-color: #3a3a3a;
-                        color: #ECECEC;
-                    }
-                    QPushButton, QToolButton {
-                        background-color: #505050;
-                        color: #ECECEC;
-                        border: 1px solid #606060;
+                self.bottom_bar.setStyleSheet(f"""
+                    QWidget {{
+                        background-color: {COLOR_DARK_BG_ALT};
+                        color: {COLOR_TEXT};
+                    }}
+                    QPushButton, QToolButton {{
+                        background-color: {COLOR_BUTTON};
+                        color: {COLOR_TEXT};
+                        border: 1px solid {COLOR_BUTTON_BORDER};
                         border-radius: 3px;
                         padding: 4px 10px;
-                    }
-                    QPushButton:hover, QToolButton:hover {
-                        background-color: #585858;
-                        border: 1px solid #60B0DC;
-                    }
-                    QLabel {
-                        color: #ECECEC;
+                    }}
+                    QPushButton:hover, QToolButton:hover {{
+                        background-color: {COLOR_BUTTON_HOVER};
+                        border: 1px solid {COLOR_ACCENT};
+                    }}
+                    QLabel {{
+                        color: {COLOR_TEXT};
                         background-color: transparent;
-                    }
+                    }}
                 """)
 
             # Style the bottom_line separator if it exists
             if hasattr(self, 'bottom_line') and self.bottom_line:
-                self.bottom_line.setStyleSheet("background-color: #555555;")
+                self.bottom_line.setStyleSheet(f"background-color: {COLOR_DARK_BORDER};")
 
             # Settings button
             settings_layout = QHBoxLayout()
@@ -940,7 +1016,7 @@ if MAESTRO_AVAILABLE and af2:
 
             # Status label
             self.status_label = QLabel("Not logged in")
-            self.status_label.setStyleSheet("color: #FF6B6B; padding: 5px; background-color: #444444;")
+            self.status_label.setStyleSheet(f"color: {COLOR_ERROR}; padding: 5px; background-color: {COLOR_DARK_BG};")
             self.status_label.setAutoFillBackground(True)
             main_layout.addWidget(self.status_label)
 
@@ -952,18 +1028,7 @@ if MAESTRO_AVAILABLE and af2:
 
         def _apply_dark_palette_recursive(self, widget):
             """Apply dark palette to widget and all its children"""
-            dark_palette = QtGui.QPalette()
-            dark_color = QtGui.QColor(68, 68, 68)
-            dark_palette.setColor(QtGui.QPalette.Window, dark_color)
-            dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(58, 58, 58))
-            dark_palette.setColor(QtGui.QPalette.AlternateBase, dark_color)
-            dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(80, 80, 80))
-            dark_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.Text, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(236, 236, 236))
-            dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(96, 176, 220))
-            dark_palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
-            dark_palette.setColor(QtGui.QPalette.PlaceholderText, QtGui.QColor(136, 136, 136))  # #888888
+            dark_palette = create_dark_palette()
 
             widget.setPalette(dark_palette)
             widget.setAutoFillBackground(True)
@@ -1000,7 +1065,7 @@ if MAESTRO_AVAILABLE and af2:
 
             # Column filters
             filters_label = QLabel("Filter Results:")
-            filters_label.setStyleSheet("font-weight: bold; margin-top: 10px; color: #ECECEC;")
+            filters_label.setStyleSheet(f"font-weight: bold; margin-top: 10px; color: {COLOR_TEXT};")
             layout.addWidget(filters_label)
 
             filters_layout = QHBoxLayout()
@@ -1216,7 +1281,7 @@ if MAESTRO_AVAILABLE and af2:
 
             # Header with current structure info
             self.files_header_label = QLabel("Associated Files - Select a structure from the Projects tab to view its files")
-            self.files_header_label.setStyleSheet("font-weight: bold; padding: 5px; color: #ECECEC;")
+            self.files_header_label.setStyleSheet(f"font-weight: bold; padding: 5px; color: {COLOR_TEXT};")
             layout.addWidget(self.files_header_label)
 
             # Checkbox to apply transformation matrix
@@ -1273,7 +1338,7 @@ if MAESTRO_AVAILABLE and af2:
 
             # Status label for file operations
             self.files_status_label = QLabel("")
-            self.files_status_label.setStyleSheet("color: #ABABAB; padding: 5px;")
+            self.files_status_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; padding: 5px;")
             layout.addWidget(self.files_status_label)
 
             widget.setLayout(layout)
@@ -1283,7 +1348,7 @@ if MAESTRO_AVAILABLE and af2:
             """Check if user is logged in and update UI accordingly"""
             if self.api_client.is_configured() and self.api_client.test_connection():
                 self.status_label.setText("Logged in successfully")
-                self.status_label.setStyleSheet("color: #7FBA7A;")
+                self.status_label.setStyleSheet(f"color: {COLOR_SUCCESS};")
                 self.submit_button.setEnabled(True)
 
                 if hasattr(self, 'projects_table') and not self.projects_loaded:
@@ -1294,7 +1359,7 @@ if MAESTRO_AVAILABLE and af2:
                         log_error(f"Failed to auto-load projects: {e}")
             else:
                 self.status_label.setText("Not logged in - click Settings to configure")
-                self.status_label.setStyleSheet("color: #FF6B6B;")
+                self.status_label.setStyleSheet(f"color: {COLOR_ERROR};")
                 self.submit_button.setEnabled(False)
 
         def open_settings(self):
@@ -1436,7 +1501,9 @@ if MAESTRO_AVAILABLE and af2:
             try:
                 # Save PDB to temporary file
                 temp_dir = tempfile.gettempdir()
-                pdb_filename = f"{object_name}.pdb"
+                # Sanitize object_name to prevent path traversal
+                safe_name = sanitize_filename(object_name)
+                pdb_filename = f"{safe_name}.pdb"
                 pdb_path = os.path.join(temp_dir, pdb_filename)
 
                 with open(pdb_path, 'w') as f:
@@ -1465,8 +1532,11 @@ if MAESTRO_AVAILABLE and af2:
                 # Clean up temp file
                 try:
                     os.remove(pdb_path)
-                except:
+                except FileNotFoundError:
+                    # File already removed or never created
                     pass
+                except OSError as e:
+                    log_debug(f"Could not remove temporary PDB file {pdb_path}: {e}")
 
             except Exception as e:
                 log_error(f"Error loading PDB into Maestro: {e}")
@@ -2245,7 +2315,9 @@ if MAESTRO_AVAILABLE and af2:
 
                 if file_data:
                     temp_dir = tempfile.gettempdir()
-                    file_path = os.path.join(temp_dir, filename)
+                    # Sanitize filename to prevent path traversal
+                    safe_filename = sanitize_filename(filename)
+                    file_path = os.path.join(temp_dir, safe_filename)
 
                     with open(file_path, 'wb') as f:
                         f.write(file_data)
@@ -2288,8 +2360,12 @@ if MAESTRO_AVAILABLE and af2:
                                 map_type = 'ccp4'  # Both CCP4 and MRC use ccp4 map type
 
                                 # Use visimport command to load the map onto the entry
-                                surface_name = os.path.splitext(filename)[0]
-                                cmd = f'visimport entry={entry_id} map_type={map_type} isovalue=1.0 "{file_path}":::{surface_name}'
+                                # Sanitize surface_name to prevent command injection
+                                raw_surface_name = os.path.splitext(safe_filename)[0]
+                                surface_name = sanitize_surface_name(raw_surface_name)
+                                # Escape quotes in file path
+                                safe_file_path = file_path.replace('"', r'\"')
+                                cmd = f'visimport entry={entry_id} map_type={map_type} isovalue=1.0 "{safe_file_path}":::{surface_name}'
                                 log_debug(f"Importing map with command: {cmd}")
 
                                 try:
@@ -2324,8 +2400,10 @@ if MAESTRO_AVAILABLE and af2:
                     if file_format in structure_formats:
                         try:
                             os.remove(file_path)
-                        except:
+                        except FileNotFoundError:
                             pass
+                        except OSError as e:
+                            log_debug(f"Could not remove temporary file {file_path}: {e}")
 
                 else:
                     self.files_status_label.setText("Failed to download file")
@@ -2381,16 +2459,16 @@ if MAESTRO_AVAILABLE and af2:
                 file_data = self.api_client.download_file(file_info)
 
                 if file_data:
-                    import subprocess
-
                     temp_dir = os.path.join(tempfile.gettempdir(), '3decision_downloads')
                     os.makedirs(temp_dir, exist_ok=True)
-                    file_path = os.path.join(temp_dir, filename)
+                    # Sanitize filename to prevent path traversal
+                    safe_filename = sanitize_filename(filename)
+                    file_path = os.path.join(temp_dir, safe_filename)
 
                     with open(file_path, 'wb') as f:
                         f.write(file_data)
 
-                    self.files_status_label.setText(f"Opening {filename} with system application...")
+                    self.files_status_label.setText(f"Opening {safe_filename} with system application...")
 
                     self._open_file_with_system(file_path)
 
@@ -2407,14 +2485,31 @@ if MAESTRO_AVAILABLE and af2:
 
         def _open_file_with_system(self, file_path: str):
             """Open a file with the system's default application."""
-            import subprocess
-
-            if sys.platform == 'darwin':  # macOS
-                subprocess.run(['open', file_path], check=True)
-            elif sys.platform == 'win32':  # Windows
-                os.startfile(file_path)
-            else:  # Linux
-                subprocess.run(['xdg-open', file_path], check=True)
+            try:
+                if sys.platform == 'darwin':  # macOS
+                    subprocess.run(['open', file_path], check=True, timeout=30)
+                elif sys.platform == 'win32':  # Windows
+                    os.startfile(file_path)
+                else:  # Linux
+                    subprocess.run(['xdg-open', file_path], check=True, timeout=30)
+            except subprocess.CalledProcessError as e:
+                log_error(f"Failed to open file with system application (exit code {e.returncode}): {e}")
+                QMessageBox.warning(
+                    self, "Error",
+                    f"Failed to open file with the system's default application.\n\nDetails: {e}"
+                )
+            except subprocess.TimeoutExpired:
+                log_error(f"Timeout while opening file: {file_path}")
+                QMessageBox.warning(
+                    self, "Timeout",
+                    "The system application took too long to respond."
+                )
+            except OSError as e:
+                log_error(f"OS error while opening file: {e}")
+                QMessageBox.warning(
+                    self, "Error",
+                    f"An operating system error occurred.\n\nDetails: {e}"
+                )
 
 else:
     # Fallback for when Maestro is not available (testing outside Maestro)
@@ -2498,7 +2593,7 @@ else:
 
             # Status
             self.status_label = QLabel("Not logged in")
-            self.status_label.setStyleSheet("color: #FF6B6B;")
+            self.status_label.setStyleSheet(f"color: {COLOR_ERROR};")
             main_layout.addWidget(self.status_label)
 
             self.setLayout(main_layout)
@@ -2506,11 +2601,11 @@ else:
         def check_login_status(self):
             if self.api_client.is_configured() and self.api_client.test_connection():
                 self.status_label.setText("Logged in successfully")
-                self.status_label.setStyleSheet("color: #7FBA7A;")
+                self.status_label.setStyleSheet(f"color: {COLOR_SUCCESS};")
                 self.submit_button.setEnabled(True)
             else:
                 self.status_label.setText("Not logged in - click Settings")
-                self.status_label.setStyleSheet("color: #FF6B6B;")
+                self.status_label.setStyleSheet(f"color: {COLOR_ERROR};")
                 self.submit_button.setEnabled(False)
 
         def open_settings(self):

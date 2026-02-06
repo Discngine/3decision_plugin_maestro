@@ -19,6 +19,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Simple logging state - stored as module-level variable
 _logging_enabled = False
 
+# SSL verification setting - enabled by default for security
+_ssl_verify_enabled = True
+
 # Private structure naming attribute - stored as module-level variable
 # Options: 'label', 'title', 'external_code', 'internal_id'
 _private_structure_naming_attribute = 'label'
@@ -32,6 +35,20 @@ def is_logging_enabled():
     """Check if logging is enabled"""
     global _logging_enabled
     return _logging_enabled
+
+def set_ssl_verify_enabled(enabled):
+    """Enable or disable SSL certificate verification.
+
+    SSL verification is enabled by default for security.
+    Only disable for development/internal servers with self-signed certificates.
+    """
+    global _ssl_verify_enabled
+    _ssl_verify_enabled = enabled
+
+def is_ssl_verify_enabled():
+    """Check if SSL verification is enabled"""
+    global _ssl_verify_enabled
+    return _ssl_verify_enabled
 
 def set_private_structure_naming_attribute(attribute):
     """Set the attribute to use for naming private structures.
@@ -78,10 +95,10 @@ class ThreeDecisionAPIClient:
         self.api_key = None
         self.token = None
         self.session = requests.Session()
-        # Disable SSL certificate verification for all requests
-        self.session.verify = False
         self.config_file = os.path.expanduser("~/.3decision_maestro_config")
         self.load_config()
+        # Apply SSL verification setting (loaded from config)
+        self.session.verify = is_ssl_verify_enabled()
 
     def load_config(self):
         """Load configuration from file"""
@@ -99,6 +116,11 @@ class ThreeDecisionAPIClient:
                     log_enabled_str = config['API'].get('logging_enabled', 'false')
                     log_enabled = log_enabled_str.lower() == 'true'
                     set_logging_enabled(log_enabled)
+
+                    # Load SSL verification setting (defaults to true for security)
+                    ssl_verify_str = config['API'].get('ssl_verify', 'true')
+                    ssl_verify = ssl_verify_str.lower() == 'true'
+                    set_ssl_verify_enabled(ssl_verify)
 
                     # Load private structure naming attribute setting
                     naming_attr = config['API'].get('private_structure_naming_attribute', 'label')
@@ -122,11 +144,16 @@ class ThreeDecisionAPIClient:
                 'api_key': self.api_key or '',
                 'token': self.token or '',
                 'logging_enabled': str(is_logging_enabled()).lower(),
+                'ssl_verify': str(is_ssl_verify_enabled()).lower(),
                 'private_structure_naming_attribute': get_private_structure_naming_attribute()
             }
 
             with open(self.config_file, 'w') as f:
                 config.write(f)
+
+            # Set restrictive permissions (owner read/write only) for security
+            import stat
+            os.chmod(self.config_file, stat.S_IRUSR | stat.S_IWUSR)
 
         except Exception as e:
             log_error(f"Error saving config: {e}")
@@ -193,6 +220,12 @@ class ThreeDecisionAPIClient:
     def save_naming_attribute_setting(self, attribute: str):
         """Save private structure naming attribute setting to config file"""
         set_private_structure_naming_attribute(attribute)
+        self.save_config()
+
+    def save_ssl_setting(self, enabled: bool):
+        """Save SSL verification setting to config file"""
+        set_ssl_verify_enabled(enabled)
+        self.session.verify = enabled
         self.save_config()
 
     def configure(self, base_url: str, api_key: str):
@@ -270,18 +303,36 @@ class ThreeDecisionAPIClient:
             return False
 
     def test_connection(self) -> bool:
-        """Test API connection"""
+        """Test API connection and validate authentication token"""
         if not self.is_configured():
             return False
 
-        # If we have a token, assume it's valid and don't test
-        if self.token and 'Authorization' in self.session.headers:
-            log_debug("Using existing token for connection")
-            return True
+        # If no token, try to login first
+        if not (self.token and 'Authorization' in self.session.headers):
+            log_debug("No valid token found, attempting login")
+            return self.login()
 
-        # Try to login if no token
-        log_debug("No token found, attempting login")
-        return self.login()
+        # We have a token - make a lightweight request to verify it's still valid
+        test_url = self.base_url.rstrip('/') + '/'
+        log_debug(f"Testing API connection with existing token against {test_url}")
+        try:
+            response = self.session.get(test_url, timeout=10)
+
+            # If unauthorized, token is invalid - try to login again
+            if response.status_code in (401, 403):
+                log_debug(f"Token validation returned {response.status_code}, attempting re-login")
+                return self.login()
+
+            if 200 <= response.status_code < 400:
+                log_debug("Connection test succeeded with existing token")
+                return True
+
+            log_error(f"Connection test failed with status code: {response.status_code}")
+            return False
+
+        except requests.RequestException as e:
+            log_error(f"Connection test failed due to network error: {e}")
+            return False
 
     def submit_search(self, query: str) -> Optional[Dict[str, Any]]:
         """Submit a search query and return job info"""
