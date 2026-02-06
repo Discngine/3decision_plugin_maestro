@@ -303,36 +303,23 @@ class ThreeDecisionAPIClient:
             return False
 
     def test_connection(self) -> bool:
-        """Test API connection and validate authentication token"""
+        """Test API connection.
+
+        If we have a token, we trust it's valid. The _request_with_retry method
+        will handle re-authentication if the token expires during actual API calls.
+        If no token exists, we attempt to login.
+        """
         if not self.is_configured():
             return False
 
-        # If no token, try to login first
-        if not (self.token and 'Authorization' in self.session.headers):
-            log_debug("No valid token found, attempting login")
-            return self.login()
+        # If we have a token, trust it - _request_with_retry handles re-auth if needed
+        if self.token and 'Authorization' in self.session.headers:
+            log_debug("Using existing token for connection")
+            return True
 
-        # We have a token - make a lightweight request to verify it's still valid
-        test_url = self.base_url.rstrip('/') + '/'
-        log_debug(f"Testing API connection with existing token against {test_url}")
-        try:
-            response = self.session.get(test_url, timeout=10)
-
-            # If unauthorized, token is invalid - try to login again
-            if response.status_code in (401, 403):
-                log_debug(f"Token validation returned {response.status_code}, attempting re-login")
-                return self.login()
-
-            if 200 <= response.status_code < 400:
-                log_debug("Connection test succeeded with existing token")
-                return True
-
-            log_error(f"Connection test failed with status code: {response.status_code}")
-            return False
-
-        except requests.RequestException as e:
-            log_error(f"Connection test failed due to network error: {e}")
-            return False
+        # No token - try to login
+        log_debug("No token found, attempting login")
+        return self.login()
 
     def submit_search(self, query: str) -> Optional[Dict[str, Any]]:
         """Submit a search query and return job info"""
